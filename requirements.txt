@@ -1,0 +1,3 @@
+fastapi
+uvicorn[standard]
+edge-tts>=6.1.0
