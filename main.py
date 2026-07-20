@@ -53,7 +53,10 @@ DEFAULT_VOICE = "my-MM-NilarNeural"        # or my-MM-ThihaNeural
 # Full/faithful translations are often longer than the source, so allow a
 # listenable ceiling (+40%). Beyond this we don't push faster (it gets unclear) —
 # the extra spills into the following silence gap instead.
-MAX_SPEEDUP = 0.40                         # +40%
+MAX_SPEEDUP = 0.40                         # +40% (dub mode)
+# Recap narration should stay natural — barely nudge it, and rely on
+# duration-calibrated script length instead of speed to keep pace with the video.
+RECAP_SPEEDUP = 0.15                        # +15% (recap mode)
 # If a clip is only slightly longer than its slot, don't bother re-synthesizing.
 SLACK = 0.05                               # 5%
 
@@ -234,12 +237,14 @@ def rescript_recap(windows: List[Dict], target: str = "Burmese") -> None:
         "Rewrite it as an engaging THIRD-PERSON NARRATOR recap — NOT a literal translation of "
         "the dialogue. Tell the story: what happens, who does what, the stakes and turns. "
         "Item 0 must open with a short punchy HOOK that makes viewers want to keep watching.\n"
+        "LENGTH CALIBRATION (most important): each beat must be speakable at a NATURAL, unhurried "
+        "narrator pace within its 'sec' seconds — roughly 3 to 4 Burmese syllables per second, so "
+        "about (sec x 3) syllables, a little UNDER is better than over. Do NOT write more than fits; "
+        "if a window is short, use only a few words. The beats are played one after another as a "
+        "continuous recap, so keep a steady flow.\n"
         "Rules:\n"
         "- Exactly one narration beat per window, SAME index and order.\n"
-        "- Each beat MUST be short enough to be spoken within its 'sec' seconds at a natural "
-        "narrator pace. The beats should read as ONE continuous recap when played in order.\n"
         f"- Natural spoken {target}, storytelling tone. No scene numbers, no stage directions.\n"
-        "- If a window has little content, keep its beat very short rather than padding it.\n"
         "Return ONLY a JSON array of objects like {\"i\": 0, \"t\": \"...\"}, same length and "
         "order, no markdown, no commentary.\n\n"
         + json.dumps(numbered, ensure_ascii=False)
@@ -282,7 +287,8 @@ def azure_tts(text: str, voice: str, rate_pct: int = 0) -> AudioSegment:
     return AudioSegment.from_file(io.BytesIO(r.content), format="wav")
 
 
-def synth_segment_hybrid(text: str, slot_ms: int, voice: str) -> AudioSegment:
+def synth_segment_hybrid(text: str, slot_ms: int, voice: str,
+                         max_speedup: float = MAX_SPEEDUP) -> AudioSegment:
     """
     HYBRID strategy (full translation + speed-up to fit):
       1. synthesize at natural rate, measure it
@@ -296,7 +302,7 @@ def synth_segment_hybrid(text: str, slot_ms: int, voice: str) -> AudioSegment:
     if slot_ms <= 0 or len(clip) <= slot_ms * (1 + SLACK):
         return clip
     needed = len(clip) / slot_ms - 1.0          # e.g. 0.35 => 35% too long
-    rate_pct = int(round(min(needed, MAX_SPEEDUP) * 100))
+    rate_pct = int(round(min(needed, max_speedup) * 100))
     if rate_pct <= 0:
         return clip
     return azure_tts(text, voice, rate_pct)
@@ -322,6 +328,33 @@ def build_timeline(segments: List[Dict], total_ms: int, voice: str) -> AudioSegm
     return base
 
 
+def build_timeline_recap(windows: List[Dict], total_ms: int, voice: str) -> AudioSegment:
+    """
+    RECAP assembler — narration plays as ONE continuous voice, never overlapping.
+    Beats are laid end-to-end (sequential). Each beat is soft-anchored to its scene:
+    if we're ahead of the scene, wait in silence; each beat is only gently sped up
+    (RECAP_SPEEDUP) to keep pace with the next scene. Records the ACTUAL play times
+    on each window so the SRT matches the audio.
+    """
+    out = AudioSegment.silent(duration=0, frame_rate=24000)
+    cursor = 0
+    n = len(windows)
+    for i, w in enumerate(windows):
+        if w["start_ms"] > cursor:                     # ahead of schedule -> wait
+            out += AudioSegment.silent(duration=w["start_ms"] - cursor, frame_rate=24000)
+            cursor = w["start_ms"]
+        next_start = windows[i + 1]["start_ms"] if i + 1 < n else total_ms
+        room = max(1500, next_start - cursor)          # time before the next scene
+        clip = synth_segment_hybrid(w["speak"], room, voice, max_speedup=RECAP_SPEEDUP)
+        w["play_start"] = cursor
+        w["play_end"] = cursor + len(clip)
+        out += clip
+        cursor += len(clip)
+    if total_ms > cursor:                              # pad tail to the video length
+        out += AudioSegment.silent(duration=total_ms - cursor, frame_rate=24000)
+    return out
+
+
 def build_srt(segments: List[Dict]) -> str:
     def ts(ms):
         h, ms = divmod(ms, 3600000)
@@ -330,8 +363,10 @@ def build_srt(segments: List[Dict]) -> str:
         return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
     lines = []
     for i, s in enumerate(segments, 1):
+        start = s.get("play_start", s["start_ms"])     # actual audio time if known
+        end = s.get("play_end", s["end_ms"])
         lines.append(str(i))
-        lines.append(f"{ts(s['start_ms'])} --> {ts(s['end_ms'])}")
+        lines.append(f"{ts(start)} --> {ts(end)}")
         lines.append(s.get("speak", s.get("text", "")))
         lines.append("")
     return "\n".join(lines)
@@ -369,11 +404,11 @@ async def process(
         if mode == "dub":
             beats = segments
             translate_segments(beats, target_lang)      # sets beat["speak"]
+            timeline = build_timeline(beats, total_ms, voice)          # anchored
         else:                                            # recap (narrator)
             beats = build_windows(segments)
             rescript_recap(beats, target_lang)           # sets beat["speak"]
-
-        timeline = build_timeline(beats, total_ms, voice)
+            timeline = build_timeline_recap(beats, total_ms, voice)    # sequential
 
         mp3_buf = io.BytesIO()
         timeline.export(mp3_buf, format="mp3", bitrate="128k")
