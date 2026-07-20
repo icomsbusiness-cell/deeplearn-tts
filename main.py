@@ -50,7 +50,10 @@ GROQ_MODEL = "whisper-large-v3"
 DEFAULT_VOICE = "my-MM-NilarNeural"        # or my-MM-ThihaNeural
 
 # Hybrid timing knob: how much we are allowed to speed a clip up to fit its slot.
-MAX_SPEEDUP = 0.20                         # +20%
+# Full/faithful translations are often longer than the source, so allow a
+# listenable ceiling (+40%). Beyond this we don't push faster (it gets unclear) —
+# the extra spills into the following silence gap instead.
+MAX_SPEEDUP = 0.40                         # +40%
 # If a clip is only slightly longer than its slot, don't bother re-synthesizing.
 SLACK = 0.05                               # 5%
 
@@ -177,11 +180,12 @@ def translate_segments(segments: List[Dict], target: str = "Burmese") -> None:
         for i, s in enumerate(segments)
     ]
     prompt = (
-        f"Translate each item's 'text' into natural spoken {target} for a voiceover. "
-        "CRITICAL: each translation must be short enough to be spoken comfortably "
-        "within its 'sec' seconds. Be concise — drop filler, prefer short natural phrasing. "
-        "Shorter is better than complete. Return ONLY a JSON array of objects like "
-        "{\"i\": 0, \"t\": \"...\"}, same length and order, no markdown, no commentary.\n\n"
+        f"Translate each item's 'text' into natural, FAITHFUL spoken {target} for a "
+        "voiceover — keep the FULL meaning, do not omit or summarize content. It is OK if a "
+        "translation runs a little long; the voice will be sped up to fit its 'sec' seconds. "
+        "Just write complete, natural {t}. Return ONLY a JSON array of objects like "
+        "{{\"i\": 0, \"t\": \"...\"}}, same length and order, no markdown, no commentary.\n\n"
+        .format(t=target)
         + json.dumps(numbered, ensure_ascii=False)
     )
     items = _gemini_json(prompt)
@@ -280,12 +284,12 @@ def azure_tts(text: str, voice: str, rate_pct: int = 0) -> AudioSegment:
 
 def synth_segment_hybrid(text: str, slot_ms: int, voice: str) -> AudioSegment:
     """
-    HYBRID +-20% strategy:
+    HYBRID strategy (full translation + speed-up to fit):
       1. synthesize at natural rate, measure it
       2. if it fits the slot (within +5%): keep as-is (natural voice)
-      3. if it's too long: re-synthesize ONE time with Azure rate, capped at +20%
+      3. if it's too long: re-synthesize ONCE with Azure rate, capped at MAX_SPEEDUP
          (Azure changes tempo without wrecking pitch — better than ffmpeg atempo)
-      4. residual overflow is absorbed later by the silence gaps (cursor logic)
+      4. anything still over the cap spills into the following silence gap
     Short clips are never stretched to fill — we just leave trailing silence.
     """
     clip = azure_tts(text, voice, 0)
