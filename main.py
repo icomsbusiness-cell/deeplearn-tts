@@ -128,11 +128,16 @@ def translate_segments(segments: List[Dict], target: str = "Burmese") -> None:
     """Translate all segments in ONE Gemini call so count/order is preserved."""
     if not segments:
         return
-    numbered = [{"i": i, "text": s["text"]} for i, s in enumerate(segments)]
+    numbered = [
+        {"i": i, "sec": round((s["end_ms"] - s["start_ms"]) / 1000, 1), "text": s["text"]}
+        for i, s in enumerate(segments)
+    ]
     prompt = (
-        f"Translate each item's 'text' into natural spoken {target}. "
-        "Keep it concise and speakable (this is for a voiceover). "
-        "Return ONLY a JSON array of objects like {\"i\": 0, \"t\": \"...\"}, "
+        f"Translate each item's 'text' into natural spoken {target} for a voiceover. "
+        "CRITICAL: each translation must be short enough to be spoken comfortably "
+        "within its 'sec' seconds. Be concise — drop filler, avoid literal word-for-word "
+        "padding, prefer short natural phrasing that keeps the meaning. Shorter is better "
+        "than complete. Return ONLY a JSON array of objects like {\"i\": 0, \"t\": \"...\"}, "
         "same length and order, no markdown, no commentary.\n\n"
         + json.dumps(numbered, ensure_ascii=False)
     )
@@ -210,16 +215,20 @@ def synth_segment_hybrid(text: str, slot_ms: int, voice: str) -> AudioSegment:
 # ---------------------------------------------------------------- assembler
 
 def build_timeline(segments: List[Dict], total_ms: int, voice: str) -> AudioSegment:
-    """Silence base the length of the video; overlay each clip at its start time."""
+    """
+    Anchor every clip at its ORIGINAL start_ms so the voice lines up with the
+    video and the SRT (no cursor drift). Each clip is fit (hybrid +-20%) to the
+    real space it has — the gap up to where the NEXT line starts — so it neither
+    drifts late nor bleeds over the next line.
+    """
     base = AudioSegment.silent(duration=total_ms, frame_rate=24000)
-    cursor = 0
-    for s in segments:
-        slot = s["end_ms"] - s["start_ms"]
-        clip = synth_segment_hybrid(s["translated"], slot, voice)
+    n = len(segments)
+    for i, s in enumerate(segments):
+        next_start = segments[i + 1]["start_ms"] if i + 1 < n else total_ms
+        room = max(s["end_ms"] - s["start_ms"], next_start - s["start_ms"])
+        clip = synth_segment_hybrid(s["translated"], room, voice)
         s["tts_dur_ms"] = len(clip)
-        place_at = max(s["start_ms"], cursor)   # never overlap the previous clip
-        base = base.overlay(clip, position=place_at)
-        cursor = place_at + len(clip)
+        base = base.overlay(clip, position=s["start_ms"])   # anchored to true time
     return base
 
 
